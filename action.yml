@@ -1,0 +1,121 @@
+# keel-run/deploy: deploy a keel.run service from GitHub Actions.
+# Installs the keel CLI (checksums verified by install.sh), deploys and
+# waits for the result. Use an agent token (keel tokens create --agent)
+# limited to the project, stored as a repository secret.
+name: Deploy to keel.run
+description: Deploy a service to keel.run (EU) and wait until it is live.
+author: keel.run
+branding:
+  icon: upload-cloud
+  color: green
+
+inputs:
+  token:
+    description: keel.run API token (agent or CI token with the deploy scope). Store it as a secret.
+    required: true
+  service:
+    description: Service name or ID.
+    required: true
+  project:
+    description: Project name or ID.
+    required: true
+  environment:
+    description: Environment name or ID.
+    default: production
+  workspace:
+    description: Workspace ID (only needed when the token reaches several workspaces).
+    default: ""
+  source:
+    description: "upload: deploy the checked-out directory (or `directory`); git: build the service's branch head or `commit` on keel.run."
+    default: upload
+  directory:
+    description: Directory to upload (source upload).
+    default: "."
+  commit:
+    description: Commit SHA to deploy (source git; default the branch head).
+    default: ""
+  timeout:
+    description: How long to wait for the deployment, e.g. 20m.
+    default: 30m
+  cli-version:
+    description: keel CLI release, e.g. v0.1.3 (default the latest).
+    default: ""
+  api-url:
+    description: API URL (self-hosted or staging installations).
+    default: https://api.keel.run
+
+outputs:
+  deployment-id:
+    description: ID of the deployment (dpl_…).
+    value: ${{ steps.deploy.outputs.id }}
+  status:
+    description: Final status of the deployment (active, failed, …).
+    value: ${{ steps.deploy.outputs.status }}
+  url:
+    description: The service's public URL (web services).
+    value: ${{ steps.url.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install the keel CLI
+      shell: bash
+      env:
+        KEEL_VERSION: ${{ inputs.cli-version }}
+        KEEL_INSTALL_DIR: ${{ runner.temp }}/keel-cli
+      run: |
+        set -euo pipefail
+        curl -fsSL https://keel.run/install.sh | sh
+        echo "$KEEL_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Deploy
+      id: deploy
+      shell: bash
+      env:
+        KEEL_TOKEN: ${{ inputs.token }}
+        KEEL_API_URL: ${{ inputs.api-url }}
+        KEEL_WORKSPACE: ${{ inputs.workspace }}
+        IN_SERVICE: ${{ inputs.service }}
+        IN_PROJECT: ${{ inputs.project }}
+        IN_ENV: ${{ inputs.environment }}
+        IN_SOURCE: ${{ inputs.source }}
+        IN_DIR: ${{ inputs.directory }}
+        IN_COMMIT: ${{ inputs.commit }}
+        IN_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -uo pipefail
+        args=(deploy --json --watch --yes --timeout "$IN_TIMEOUT" --project "$IN_PROJECT" --environment "$IN_ENV" --service "$IN_SERVICE")
+        case "$IN_SOURCE" in
+          upload) args+=(--dir "$IN_DIR") ;;
+          git) args+=(--git); if [ -n "$IN_COMMIT" ]; then args+=(--commit "$IN_COMMIT"); fi ;;
+          *) echo "::error title=keel deploy::source must be upload or git"; exit 2 ;;
+        esac
+        out="$RUNNER_TEMP/keel-deploy.json"
+        keel "${args[@]}" > "$out"
+        code=$?
+        id=$(jq -r '.id // empty' "$out" 2>/dev/null || true)
+        status=$(jq -r '.status // empty' "$out" 2>/dev/null || true)
+        echo "id=$id" >> "$GITHUB_OUTPUT"
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        if [ "$code" -ne 0 ]; then
+          echo "::error title=keel deploy::deployment ${id:-?} ended ${status:-with exit code $code}"
+        fi
+        exit "$code"
+
+    - name: Service URL
+      id: url
+      if: success()
+      shell: bash
+      env:
+        KEEL_TOKEN: ${{ inputs.token }}
+        KEEL_API_URL: ${{ inputs.api-url }}
+        KEEL_WORKSPACE: ${{ inputs.workspace }}
+        IN_SERVICE: ${{ inputs.service }}
+        IN_PROJECT: ${{ inputs.project }}
+        IN_ENV: ${{ inputs.environment }}
+      run: |
+        set -uo pipefail
+        url=$(keel status --json --project "$IN_PROJECT" --environment "$IN_ENV" --service "$IN_SERVICE" 2>/dev/null \
+          | jq -r '[.domains[]? | select(.kind == "generated")][0] | if . == null then empty else (.url // ("https://" + .hostname)) end' || true)
+        echo "url=$url" >> "$GITHUB_OUTPUT"
+        if [ -n "$url" ]; then echo "### Deployed to keel.run: $url" >> "$GITHUB_STEP_SUMMARY"; fi
